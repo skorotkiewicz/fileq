@@ -8,7 +8,7 @@ const DEFAULT_PORT: u16 = 4433;
 // --- TLS helpers (self-signed, zero config) ---
 
 fn server_tls() -> Result<ServerConfig> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "0.0.0.0".into()])?;
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
     let cert = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
 
