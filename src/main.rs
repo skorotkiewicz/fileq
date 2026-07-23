@@ -1,8 +1,13 @@
 use anyhow::{bail, Context, Result};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-const ALPN: &[u8] = b"fileq/1";
+const ALPN: &[u8] = b"fileq/2";
 const DEFAULT_PORT: u16 = 4433;
 
 // --- TLS helpers ---
@@ -70,7 +75,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     }
 }
 
-// --- Protocol: [u64 path_len][path][u64 offset] → [bytes until FIN]
+// --- Protocol: [u64 path_len][path][u64 offset] → [u64 file_size][bytes until FIN]
 
 async fn send_request(stream: &mut quinn::SendStream, path: &str, offset: u64) -> Result<()> {
     let b = path.as_bytes();
@@ -138,6 +143,16 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
                         }
                     };
 
+                    let file_size = match file.metadata().await {
+                        Ok(meta) => meta.len(),
+                        Err(_) => return,
+                    };
+                    if offset > file_size {
+                        let _ = send.write_all(b"416").await;
+                        let _ = send.finish();
+                        return;
+                    }
+
                     use tokio::io::{AsyncReadExt, AsyncSeekExt};
                     if offset > 0 {
                         if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
@@ -148,6 +163,10 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
                         eprintln!("→ {} (resume from {})", clean, offset);
                     } else {
                         eprintln!("→ {}", clean);
+                    }
+
+                    if send.write_all(&file_size.to_be_bytes()).await.is_err() {
+                        return;
                     }
 
                     // Stream in chunks
@@ -172,6 +191,32 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
 }
 
 // --- Client ---
+
+fn progress_line(total: u64, transferred: u64, file_size: u64, elapsed: Duration) -> String {
+    let percent = if file_size == 0 {
+        100
+    } else {
+        (u128::from(total.min(file_size)) * 100 / u128::from(file_size)) as u64
+    };
+    let speed = if elapsed.is_zero() {
+        0.0
+    } else {
+        transferred as f64 / elapsed.as_secs_f64()
+    };
+    let eta = if speed == 0.0 {
+        0
+    } else {
+        (file_size.saturating_sub(total) as f64 / speed) as u64
+    };
+
+    format!(
+        "{percent:3}% {}KB {:.1}KB/s   {:02}:{:02} ETA",
+        total / 1024,
+        speed / 1024.0,
+        eta / 60,
+        eta % 60
+    )
+}
 
 async fn get(url_str: &str, resume: bool) -> Result<()> {
     let url = url::Url::parse(url_str)?;
@@ -205,6 +250,12 @@ async fn get(url_str: &str, resume: bool) -> Result<()> {
 
     send_request(&mut send, &path, offset).await?;
 
+    let mut size_buf = [0u8; 8];
+    recv.read_exact(&mut size_buf)
+        .await
+        .context("server did not return a file size")?;
+    let file_size = u64::from_be_bytes(size_buf);
+
     use tokio::io::AsyncWriteExt;
 
     let mut file = tokio::fs::OpenOptions::new()
@@ -217,17 +268,31 @@ async fn get(url_str: &str, resume: bool) -> Result<()> {
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = offset;
+    let mut transferred = 0;
+    let started = Instant::now();
+    let mut last_progress = started;
     loop {
         match recv.read(&mut buf).await? {
             None => break,
             Some(n) => {
                 file.write_all(&buf[..n]).await?;
                 total += n as u64;
-                eprint!("\r{}: {} bytes", filename, total);
+                transferred += n as u64;
+                let now = Instant::now();
+                if now.duration_since(last_progress) >= Duration::from_millis(100) {
+                    eprint!(
+                        "\r{:<60}",
+                        progress_line(total, transferred, file_size, now.duration_since(started))
+                    );
+                    last_progress = now;
+                }
             }
         }
     }
-    eprintln!();
+    eprintln!(
+        "\r{:<60}",
+        progress_line(total, transferred, file_size, started.elapsed())
+    );
     file.flush().await?;
 
     Ok(())
@@ -249,5 +314,23 @@ async fn main() -> Result<()> {
             eprintln!("usage:\n  quic serve <dir>\n  quic get <url>\n  quic get -c <url>");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_progress() {
+        assert_eq!(
+            progress_line(
+                1536 * 1024,
+                1024 * 1024,
+                3072 * 1024,
+                Duration::from_secs(2)
+            ),
+            " 50% 1536KB 512.0KB/s   00:03 ETA"
+        );
     }
 }
