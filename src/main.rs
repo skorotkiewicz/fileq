@@ -192,7 +192,11 @@ async fn get(url_str: &str, resume: bool) -> Result<()> {
         0
     };
 
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    // let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await?
+        .next()
+        .context("dns lookup failed")?;
     let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
     ep.set_default_client_config(client_tls()?);
 
