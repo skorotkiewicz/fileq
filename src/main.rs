@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 use std::{
     net::SocketAddr,
     path::Path,
@@ -9,6 +9,42 @@ use std::{
 
 const ALPN: &[u8] = b"fileq/2";
 const DEFAULT_PORT: u16 = 4433;
+
+// --- Constants ---
+
+const INITIAL_CHUNK: usize = 4 * 1024;
+const MAX_CHUNK: usize = 256 * 1024;
+const MIN_CHUNK: usize = 512;
+const GROW_THRESHOLD: u32 = 8;
+
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_IDLE_TIMEOUT_MS: u64 = 180_000;
+
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+const MAX_RETRIES: u32 = 15;
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_CAP: Duration = Duration::from_secs(30);
+
+const STREAM_WINDOW: u64 = 256 * 1024;
+const CONNECTION_WINDOW: u64 = 512 * 1024;
+
+const PROGRESS_FAST: Duration = Duration::from_millis(200);
+const PROGRESS_SLOW: Duration = Duration::from_millis(2000);
+const SLOW_THRESHOLD_BPS: f64 = 32.0 * 1024.0;
+
+// --- Ramp detection ---
+
+const RAMP_WINDOW: usize = 5;
+const RAMP_FACTOR: f64 = 1.4;
+const RAMP_CONFIRM: usize = 3;
+const DRAIN_FLOOR: Duration = Duration::from_millis(500);
+const BASELINE_SAMPLES: usize = 4;
+
+/// ★ Ignore latencies below this.  A 0.1ms → 0.3ms "ramp" is disk I/O noise,
+///   not bufferbloat.  Real congestion shows up as 500ms+ latencies.
+const MIN_LATENCY: Duration = Duration::from_millis(500);
 
 // --- TLS helpers ---
 
@@ -75,7 +111,175 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     }
 }
 
-// --- Protocol: [u64 path_len][path][u64 offset] → [u64 file_size][bytes until FIN]
+// --- Transport config ---
+
+fn survival_transport() -> TransportConfig {
+    let mut cfg = TransportConfig::default();
+
+    cfg.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    cfg.max_idle_timeout(Some(VarInt::from_u64(MAX_IDLE_TIMEOUT_MS).unwrap().into()));
+
+    cfg.initial_rtt(Duration::from_secs(2));
+
+    cfg.stream_receive_window(VarInt::from_u64(STREAM_WINDOW).unwrap());
+    cfg.receive_window(VarInt::from_u64(CONNECTION_WINDOW).unwrap());
+    cfg.send_window(CONNECTION_WINDOW);
+
+    cfg.max_concurrent_bidi_streams(VarInt::from_u64(4).unwrap());
+
+    cfg.min_mtu(1200);
+    cfg.initial_mtu(1200);
+
+    cfg
+}
+
+// --- Latency tracker (server-side: detects ramp, triggers pause) ---
+
+struct LatencyTracker {
+    samples: Vec<Duration>,
+    baseline: Option<Duration>,
+    count: u64,
+    ramp_streak: u32,
+}
+
+impl LatencyTracker {
+    fn new() -> Self {
+        Self {
+            samples: Vec::with_capacity(RAMP_WINDOW + 1),
+            baseline: None,
+            count: 0,
+            ramp_streak: 0,
+        }
+    }
+
+    /// Record a latency.  Returns `Some(pause)` if a bufferbloat ramp is
+    /// confirmed and the caller should stop sending to let the buffer drain.
+    fn observe(&mut self, latency: Duration) -> Option<Duration> {
+        // ★ Ignore sub-500ms latencies entirely.  They're disk I/O or
+        //   local-loopback noise, not network congestion.
+        if latency < MIN_LATENCY {
+            // A fast write means the buffer is NOT full.  Reset the streak.
+            self.ramp_streak = 0;
+            return None;
+        }
+
+        self.count += 1;
+
+        if self.count <= BASELINE_SAMPLES as u64 {
+            self.baseline = Some(match self.baseline {
+                Some(b) => b.min(latency),
+                None => latency,
+            });
+        }
+
+        if self.samples.len() >= RAMP_WINDOW {
+            self.samples.remove(0);
+        }
+        self.samples.push(latency);
+
+        if self.samples.len() >= 2 {
+            let prev = self.samples[self.samples.len() - 2];
+            let curr = self.samples[self.samples.len() - 1];
+            if curr.as_secs_f64() > prev.as_secs_f64() * RAMP_FACTOR {
+                self.ramp_streak += 1;
+            } else {
+                self.ramp_streak = 0;
+            }
+        }
+
+        if self.ramp_streak >= RAMP_CONFIRM as u32 {
+            let baseline = self.baseline.unwrap_or(MIN_LATENCY);
+            let latest = *self.samples.last().unwrap();
+            let pause = latest.saturating_sub(baseline).max(DRAIN_FLOOR);
+
+            eprintln!(
+                "\n⚠ bufferbloat ramp ({:.0}ms→{:.0}ms) — pausing {:.1}s to drain",
+                baseline.as_secs_f64() * 1000.0,
+                latest.as_secs_f64() * 1000.0,
+                pause.as_secs_f64(),
+            );
+
+            self.ramp_streak = 0;
+            self.samples.clear();
+            return Some(pause);
+        }
+
+        None
+    }
+}
+
+// --- Adaptive chunk size ---
+
+struct AdaptiveChunk {
+    size: usize,
+    full_streak: u32,
+}
+
+impl AdaptiveChunk {
+    fn new() -> Self {
+        Self {
+            size: INITIAL_CHUNK,
+            full_streak: 0,
+        }
+    }
+
+    fn observe_read(&mut self, n: usize, cap: usize) {
+        if n == cap {
+            self.full_streak += 1;
+            if self.full_streak >= GROW_THRESHOLD {
+                self.size = (self.size * 2).min(MAX_CHUNK);
+                self.full_streak = 0;
+            }
+        } else {
+            self.size = (self.size / 2).max(MIN_CHUNK);
+            self.full_streak = 0;
+        }
+    }
+
+    /// ★ Shrink based on how long we waited for data.
+    ///   Long wait = congested network = use smaller chunks.
+    fn observe_latency(&mut self, latency: Duration) {
+        if latency > Duration::from_secs(5) {
+            // Multi-second wait: slam to minimum.
+            self.size = MIN_CHUNK;
+            self.full_streak = 0;
+        } else if latency > Duration::from_secs(1) {
+            // 1-5s wait: halve.
+            self.size = (self.size / 2).max(MIN_CHUNK);
+            self.full_streak = 0;
+        } else if latency > Duration::from_millis(200) {
+            // 200ms-1s: mild congestion, nudge down.
+            self.size = (self.size * 3 / 4).max(MIN_CHUNK);
+            self.full_streak = 0;
+        }
+        // < 200ms: healthy, let the normal grow logic handle it.
+    }
+
+    fn reset_to_min(&mut self) {
+        self.size = MIN_CHUNK;
+        self.full_streak = 0;
+    }
+
+    fn buf(&self) -> Vec<u8> {
+        vec![0u8; self.size]
+    }
+}
+
+// --- Timeout wrapper (server-side) ---
+
+async fn timed_write(send: &mut quinn::SendStream, data: &[u8]) -> Result<Duration> {
+    let start = Instant::now();
+    match tokio::time::timeout(WRITE_TIMEOUT, send.write_all(data)).await {
+        Ok(Ok(())) => Ok(start.elapsed()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => bail!(
+            "write timed out after {:.0}s — connection choked",
+            WRITE_TIMEOUT.as_secs_f64()
+        ),
+    }
+}
+
+// --- Protocol ---
 
 async fn send_request(stream: &mut quinn::SendStream, path: &str, offset: u64) -> Result<()> {
     let b = path.as_bytes();
@@ -104,11 +308,15 @@ async fn recv_request(stream: &mut quinn::RecvStream) -> Result<(String, u64)> {
     Ok((path, offset))
 }
 
-// --- Server (now streams from disk, supports offset) ---
+// --- Server ---
 
 async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
     let dir = dir.canonicalize().context("bad dir")?;
-    let ep = Endpoint::server(server_tls()?, addr)?;
+
+    let mut server_cfg = server_tls()?;
+    server_cfg.transport_config(Arc::new(survival_transport()));
+
+    let ep = Endpoint::server(server_cfg, addr)?;
     eprintln!("serving {:?} on {}", dir, addr);
 
     while let Some(conn) = ep.accept().await {
@@ -132,7 +340,6 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
                     }
                     let file_path = dir.join(clean);
 
-                    // Stream from disk instead of loading whole file into RAM
                     let mut file = match tokio::fs::File::open(&file_path).await {
                         Ok(f) => f,
                         Err(_) => {
@@ -169,17 +376,43 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
                         return;
                     }
 
-                    // Stream in chunks
-                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut adaptive = AdaptiveChunk::new();
+                    let mut latency = LatencyTracker::new();
+
                     loop {
+                        let mut buf = adaptive.buf();
                         match file.read(&mut buf).await {
                             Ok(0) => break,
                             Ok(n) => {
-                                if send.write_all(&buf[..n]).await.is_err() {
-                                    break;
+                                adaptive.observe_read(n, buf.len());
+
+                                // ★ timed_write measures QUIC backpressure.
+                                //   When ACKs are 8s away, write_all blocks
+                                //   until the send window opens.  THAT latency
+                                //   is the real network signal.
+                                let elapsed = match timed_write(&mut send, &buf[..n]).await {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        eprintln!("\n✗ server write: {}", e);
+                                        let _ = send.reset(VarInt::from_u32(1));
+                                        return;
+                                    }
+                                };
+
+                                // ★ Ramp detection → pause-and-drain.
+                                //   Only fires when latency > 500ms AND
+                                //   increasing >1.4× for 3 consecutive writes.
+                                if let Some(pause) = latency.observe(elapsed) {
+                                    adaptive.reset_to_min();
+                                    tokio::time::sleep(pause).await;
                                 }
+
+                                tokio::task::yield_now().await;
                             }
-                            Err(_) => break,
+                            Err(_) => {
+                                let _ = send.reset(VarInt::from_u32(1));
+                                return;
+                            }
                         }
                     }
                     let _ = send.finish();
@@ -190,7 +423,7 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-// --- Client ---
+// --- Progress ---
 
 fn progress_line(total: u64, transferred: u64, file_size: u64, elapsed: Duration) -> String {
     let percent = if file_size == 0 {
@@ -218,17 +451,130 @@ fn progress_line(total: u64, transferred: u64, file_size: u64, elapsed: Duration
     )
 }
 
+// --- Single download attempt ---
+
+async fn download_once(
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    out_path: &std::path::Path,
+    offset: u64,
+) -> Result<u64> {
+    let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
+    let mut client_cfg = client_tls()?;
+    client_cfg.transport_config(Arc::new(survival_transport()));
+    ep.set_default_client_config(client_cfg);
+
+    let conn = ep.connect(addr, host)?.await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    send_request(&mut send, path, offset).await?;
+
+    let mut size_buf = [0u8; 8];
+    recv.read_exact(&mut size_buf)
+        .await
+        .context("server did not return file size")?;
+    let file_size = u64::from_be_bytes(size_buf);
+
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(offset > 0)
+        .truncate(offset == 0)
+        .open(out_path)
+        .await?;
+
+    let mut adaptive = AdaptiveChunk::new();
+    let mut total = offset;
+    let mut transferred: u64 = 0;
+    let started = Instant::now();
+    let mut last_progress = started;
+
+    loop {
+        let mut buf = adaptive.buf();
+
+        // ★ Measure how long we WAIT for data.  This is the real network
+        //   latency signal: on a healthy 50ms link, reads return in <100ms.
+        //   On your 8s-RTT link, reads block for ~8s.
+        let read_start = Instant::now();
+
+        let read_result = tokio::time::timeout(READ_TIMEOUT, recv.read(&mut buf)).await;
+
+        let read_latency = read_start.elapsed();
+
+        match read_result {
+            Err(_) => bail!(
+                "read timed out after {:.0}s — no data",
+                READ_TIMEOUT.as_secs_f64()
+            ),
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(n))) => {
+                adaptive.observe_read(n, buf.len());
+
+                // ★ Adapt chunk size to network latency.
+                //   8s read wait → slam to 512B.
+                //   2s read wait → halve.
+                //   300ms wait  → nudge down.
+                //   <200ms      → healthy, let it grow.
+                //   NO PAUSING.  The client is the receiver; pausing the
+                //   receiver just wastes time.  The server handles draining.
+                adaptive.observe_latency(read_latency);
+
+                file.write_all(&buf[..n]).await?;
+                total += n as u64;
+                transferred += n as u64;
+
+                let now = Instant::now();
+                let speed = if now.duration_since(started).is_zero() {
+                    0.0
+                } else {
+                    transferred as f64 / now.duration_since(started).as_secs_f64()
+                };
+                let interval = if speed < SLOW_THRESHOLD_BPS {
+                    PROGRESS_SLOW
+                } else {
+                    PROGRESS_FAST
+                };
+                if now.duration_since(last_progress) >= interval {
+                    eprint!(
+                        "\r{:<60}",
+                        progress_line(total, transferred, file_size, now.duration_since(started))
+                    );
+                    last_progress = now;
+                }
+
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    eprintln!(
+        "\r{:<60}",
+        progress_line(total, transferred, file_size, started.elapsed())
+    );
+    file.flush().await?;
+
+    if total < file_size {
+        bail!("transfer incomplete: got {total} of {file_size} bytes");
+    }
+    Ok(total)
+}
+
+// --- Auto-reconnecting client ---
+
 async fn get(url_str: &str, resume: bool) -> Result<()> {
     let url = url::Url::parse(url_str)?;
     let host = url.host_str().context("no host")?;
     let port = url.port().unwrap_or(DEFAULT_PORT);
     let path = url.path().to_string();
 
-    // Save to the URL filename; -c resumes an existing file.
     let filename = path.rsplit('/').next().unwrap_or("download");
     let out_path = std::path::PathBuf::from(filename);
 
-    let offset = if resume && out_path.exists() {
+    let mut offset = if resume && out_path.exists() {
         let meta = tokio::fs::metadata(&out_path).await?;
         let sz = meta.len();
         eprintln!("resuming {} from byte {}", filename, sz);
@@ -237,65 +583,49 @@ async fn get(url_str: &str, resume: bool) -> Result<()> {
         0
     };
 
-    // let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
         .await?
         .next()
         .context("dns lookup failed")?;
-    let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
-    ep.set_default_client_config(client_tls()?);
 
-    let conn = ep.connect(addr, host)?.await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-
-    send_request(&mut send, &path, offset).await?;
-
-    let mut size_buf = [0u8; 8];
-    recv.read_exact(&mut size_buf)
-        .await
-        .context("server did not return a file size")?;
-    let file_size = u64::from_be_bytes(size_buf);
-
-    use tokio::io::AsyncWriteExt;
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(resume)
-        .truncate(!resume)
-        .open(&out_path)
-        .await?;
-
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total = offset;
-    let mut transferred = 0;
-    let started = Instant::now();
-    let mut last_progress = started;
+    let mut attempt: u32 = 0;
     loop {
-        match recv.read(&mut buf).await? {
-            None => break,
-            Some(n) => {
-                file.write_all(&buf[..n]).await?;
-                total += n as u64;
-                transferred += n as u64;
-                let now = Instant::now();
-                if now.duration_since(last_progress) >= Duration::from_millis(100) {
-                    eprint!(
-                        "\r{:<60}",
-                        progress_line(total, transferred, file_size, now.duration_since(started))
-                    );
-                    last_progress = now;
+        if attempt > 0 {
+            let backoff = RETRY_BASE
+                .saturating_mul(1u32 << (attempt - 1).min(5))
+                .min(RETRY_CAP);
+            eprintln!(
+                "\n⟳ retry {}/{} in {:.0}s (resuming from byte {})…",
+                attempt,
+                MAX_RETRIES,
+                backoff.as_secs_f64(),
+                offset
+            );
+            tokio::time::sleep(backoff).await;
+        }
+
+        match download_once(addr, host, &path, &out_path, offset).await {
+            Ok(final_offset) => {
+                eprintln!("\n✓ done: {} ({} KB)", filename, final_offset / 1024);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("\n✗ attempt {} failed: {}", attempt + 1, e);
+
+                if out_path.exists() {
+                    offset = tokio::fs::metadata(&out_path).await?.len();
+                }
+
+                attempt += 1;
+                if attempt > MAX_RETRIES {
+                    return Err(e).context(format!(
+                        "gave up after {} retries at byte {}",
+                        MAX_RETRIES, offset
+                    ));
                 }
             }
         }
     }
-    eprintln!(
-        "\r{:<60}",
-        progress_line(total, transferred, file_size, started.elapsed())
-    );
-    file.flush().await?;
-
-    Ok(())
 }
 
 // --- CLI ---
@@ -332,5 +662,104 @@ mod tests {
             ),
             " 50% 1536KB 512.0KB/s   00:03 ETA"
         );
+    }
+
+    #[test]
+    fn adaptive_chunk_grows_and_shrinks() {
+        let mut ac = AdaptiveChunk::new();
+        assert_eq!(ac.size, INITIAL_CHUNK);
+
+        for _ in 0..GROW_THRESHOLD {
+            ac.observe_read(INITIAL_CHUNK, INITIAL_CHUNK);
+        }
+        assert_eq!(ac.size, INITIAL_CHUNK * 2);
+
+        ac.observe_read(100, ac.size);
+        assert_eq!(ac.size, INITIAL_CHUNK);
+    }
+
+    #[test]
+    fn adaptive_chunk_responds_to_latency() {
+        let mut ac = AdaptiveChunk::new();
+        // Grow it up first.
+        for _ in 0..GROW_THRESHOLD * 3 {
+            ac.observe_read(ac.size, ac.size);
+        }
+        let big = ac.size;
+        assert!(big > MIN_CHUNK);
+
+        // 8s latency → slam to min.
+        ac.observe_latency(Duration::from_secs(8));
+        assert_eq!(ac.size, MIN_CHUNK);
+
+        // Grow back.
+        for _ in 0..GROW_THRESHOLD * 2 {
+            ac.observe_read(ac.size, ac.size);
+        }
+        let medium = ac.size;
+        assert!(medium > MIN_CHUNK);
+
+        // 2s latency → halve.
+        ac.observe_latency(Duration::from_secs(2));
+        assert_eq!(ac.size, (medium / 2).max(MIN_CHUNK));
+    }
+
+    #[test]
+    fn latency_tracker_ignores_fast_writes() {
+        let mut lt = LatencyTracker::new();
+
+        // Sub-500ms "ramps" must NOT trigger.
+        for _ in 0..20 {
+            assert!(lt.observe(Duration::from_millis(1)).is_none());
+            assert!(lt.observe(Duration::from_millis(2)).is_none());
+            assert!(lt.observe(Duration::from_millis(4)).is_none());
+        }
+    }
+
+    #[test]
+    fn latency_tracker_detects_real_ramp() {
+        let mut lt = LatencyTracker::new();
+
+        // Baseline: a few writes at ~600ms (just above MIN_LATENCY).
+        for _ in 0..BASELINE_SAMPLES {
+            assert!(lt.observe(Duration::from_millis(600)).is_none());
+        }
+
+        // Real ramp: 600 → 900 → 1400 → 2200 (each >1.4× previous).
+        assert!(lt.observe(Duration::from_millis(900)).is_none()); // streak 1
+        assert!(lt.observe(Duration::from_millis(1400)).is_none()); // streak 2
+        let pause = lt.observe(Duration::from_millis(2200)); // streak 3 → fire
+        assert!(pause.is_some());
+        let pause = pause.unwrap();
+        assert!(pause > Duration::from_secs(1));
+    }
+
+    #[test]
+    fn latency_tracker_resets_on_fast_write() {
+        let mut lt = LatencyTracker::new();
+
+        lt.observe(Duration::from_millis(600));
+        lt.observe(Duration::from_millis(900)); // streak 1
+        lt.observe(Duration::from_millis(1400)); // streak 2
+
+        // A fast write (<500ms) resets the streak.
+        lt.observe(Duration::from_millis(10));
+
+        // Need 3 MORE consecutive increases to fire.
+        assert!(lt.observe(Duration::from_millis(900)).is_none()); // streak 1
+        assert!(lt.observe(Duration::from_millis(1400)).is_none()); // streak 2
+        let pause = lt.observe(Duration::from_millis(2200)); // streak 3
+        assert!(pause.is_some());
+    }
+
+    #[test]
+    fn adaptive_chunk_caps_at_max() {
+        let mut ac = AdaptiveChunk::new();
+        for _ in 0..200 {
+            for _ in 0..GROW_THRESHOLD {
+                ac.observe_read(ac.size, ac.size);
+            }
+        }
+        assert!(ac.size <= MAX_CHUNK);
     }
 }
