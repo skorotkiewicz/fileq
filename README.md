@@ -1,6 +1,6 @@
 # quic
 
-A tiny file server and client built on QUIC over UDP.
+A small QUIC file transfer tool for slow or unreliable links. It adjusts chunk sizes as latency changes and retries interrupted downloads from the last byte written.
 
 ## Usage
 
@@ -16,7 +16,7 @@ Download a file into the current directory:
 cargo run --release -- get quic://localhost:4433/example.bin
 ```
 
-Resume an interrupted download:
+Continue an existing download:
 
 ```sh
 cargo run --release -- get -c quic://localhost:4433/example.bin
@@ -24,4 +24,4 @@ cargo run --release -- get -c quic://localhost:4433/example.bin
 
 ## Security
 
-The server generates a self-signed certificate and the client skips certificate verification. Use this tool only on trusted networks.
+The server listens on all interfaces and creates a self-signed certificate each time it starts. The client accepts any certificate, so use this only on a trusted network.
