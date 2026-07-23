@@ -67,6 +67,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 const MAX_RETRIES: u32 = 15;
+const MIN_SPEED_WINDOW: Duration = Duration::from_secs(30);
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(30);
 
@@ -508,6 +509,19 @@ fn progress_line(
     )
 }
 
+fn check_min_speed(bytes: u64, elapsed: Duration, minimum: u64) -> Result<()> {
+    let speed = bytes as f64 / elapsed.as_secs_f64();
+    if speed < minimum as f64 {
+        bail!(
+            "download averaged {:.1}KB/s for {:.0}s, below minimum {}KB/s",
+            speed / 1024.0,
+            elapsed.as_secs_f64(),
+            minimum / 1024
+        );
+    }
+    Ok(())
+}
+
 // --- Single download attempt ---
 
 async fn download_once(
@@ -517,6 +531,7 @@ async fn download_once(
     out_path: &std::path::Path,
     offset: u64,
     ip_version: IpVersion,
+    min_speed_bps: Option<u64>,
 ) -> Result<u64> {
     let mut ep = endpoint(ip_version, 0, None)?;
     let mut client_cfg = client_tls()?;
@@ -553,6 +568,8 @@ async fn download_once(
     let mut transferred: u64 = 0;
     let started = Instant::now();
     let mut last_progress = started;
+    let mut speed_window_started = started;
+    let mut speed_window_bytes = 0;
 
     loop {
         let mut buf = adaptive.buf();
@@ -562,15 +579,33 @@ async fn download_once(
         //   On your 8s-RTT link, reads block for ~8s.
         let read_start = Instant::now();
 
-        let read_result = tokio::time::timeout(READ_TIMEOUT, recv.read(&mut buf)).await;
+        let read_timeout = min_speed_bps
+            .map(|_| {
+                MIN_SPEED_WINDOW
+                    .saturating_sub(speed_window_started.elapsed())
+                    .min(READ_TIMEOUT)
+            })
+            .unwrap_or(READ_TIMEOUT);
+        let read_result = tokio::time::timeout(read_timeout, recv.read(&mut buf)).await;
 
         let read_latency = read_start.elapsed();
 
         match read_result {
-            Err(_) => bail!(
-                "read timed out after {:.0}s — no data",
-                READ_TIMEOUT.as_secs_f64()
-            ),
+            Err(_) => {
+                if total >= file_size {
+                    break;
+                }
+                if let Some(minimum) = min_speed_bps {
+                    check_min_speed(speed_window_bytes, speed_window_started.elapsed(), minimum)?;
+                    speed_window_started = Instant::now();
+                    speed_window_bytes = 0;
+                    continue;
+                }
+                bail!(
+                    "read timed out after {:.0}s — no data",
+                    READ_TIMEOUT.as_secs_f64()
+                );
+            }
             Ok(Err(e)) => return Err(e.into()),
             Ok(Ok(None)) => break,
             Ok(Ok(Some(n))) => {
@@ -588,8 +623,18 @@ async fn download_once(
                 file.write_all(&buf[..n]).await?;
                 total += n as u64;
                 transferred += n as u64;
+                speed_window_bytes += n as u64;
 
                 let now = Instant::now();
+                let window_elapsed = now.duration_since(speed_window_started);
+                if let Some(minimum) = min_speed_bps {
+                    if total < file_size && window_elapsed >= MIN_SPEED_WINDOW {
+                        check_min_speed(speed_window_bytes, window_elapsed, minimum)?;
+                        speed_window_started = now;
+                        speed_window_bytes = 0;
+                    }
+                }
+
                 let speed = if now.duration_since(started).is_zero() {
                     0.0
                 } else {
@@ -633,7 +678,13 @@ async fn download_once(
 
 // --- Auto-reconnecting client ---
 
-async fn get(url_str: &str, resume: bool, ip_version: IpVersion) -> Result<()> {
+async fn get(
+    url_str: &str,
+    resume: bool,
+    ip_version: IpVersion,
+    min_speed_bps: Option<u64>,
+    max_retries: u32,
+) -> Result<()> {
     let url = url::Url::parse(url_str)?;
     let host = url
         .host_str()
@@ -669,14 +720,24 @@ async fn get(url_str: &str, resume: bool, ip_version: IpVersion) -> Result<()> {
             eprintln!(
                 "\n⟳ retry {}/{} in {:.0}s (resuming from byte {})…",
                 attempt,
-                MAX_RETRIES,
+                max_retries,
                 backoff.as_secs_f64(),
                 offset
             );
             tokio::time::sleep(backoff).await;
         }
 
-        match download_once(addr, host, &path, &out_path, offset, ip_version).await {
+        match download_once(
+            addr,
+            host,
+            &path,
+            &out_path,
+            offset,
+            ip_version,
+            min_speed_bps,
+        )
+        .await
+        {
             Ok(final_offset) => {
                 eprintln!("\n✓ done: {} ({} KB)", filename, final_offset / 1024);
                 return Ok(());
@@ -689,10 +750,10 @@ async fn get(url_str: &str, resume: bool, ip_version: IpVersion) -> Result<()> {
                 }
 
                 attempt += 1;
-                if attempt > MAX_RETRIES {
+                if attempt > max_retries {
                     return Err(e).context(format!(
                         "gave up after {} retries at byte {}",
-                        MAX_RETRIES, offset
+                        max_retries, offset
                     ));
                 }
             }
@@ -713,19 +774,76 @@ fn take_ip_version(args: &mut Vec<String>) -> Result<IpVersion> {
     Ok(if v6 { IpVersion::V6 } else { IpVersion::V4 })
 }
 
+fn take_number_option(args: &mut Vec<String>, option: &str) -> Result<Option<u64>> {
+    let prefix = format!("{option}=");
+    let mut value = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let Some(raw) = args[index].strip_prefix(&prefix) else {
+            index += 1;
+            continue;
+        };
+        if value.is_some() {
+            bail!("{option} specified more than once");
+        }
+        value = Some(
+            raw.parse()
+                .with_context(|| format!("{option} requires a non-negative integer"))?,
+        );
+        args.remove(index);
+    }
+
+    Ok(value)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     let ip_version = take_ip_version(&mut args)?;
+    let min_speed = take_number_option(&mut args, "--min-speed")?;
+    let max_retries = take_number_option(&mut args, "--max-retry")?
+        .map(u32::try_from)
+        .transpose()
+        .context("--max-retry is too large")?;
+    let min_speed_bps = match min_speed {
+        Some(0) => bail!("--min-speed must be greater than zero"),
+        Some(speed) => Some(
+            speed
+                .checked_mul(1024)
+                .context("--min-speed is too large")?,
+        ),
+        None => None,
+    };
 
     match args.as_slice() {
-        [_, command, dir] if command == "serve" => serve(Path::new(dir), ip_version).await,
-        [_, command, url] if command == "get" => get(url, false, ip_version).await,
+        [_, command, dir] if command == "serve" && min_speed.is_none() && max_retries.is_none() => {
+            serve(Path::new(dir), ip_version).await
+        }
+        [_, command, url] if command == "get" => {
+            get(
+                url,
+                false,
+                ip_version,
+                min_speed_bps,
+                max_retries.unwrap_or(MAX_RETRIES),
+            )
+            .await
+        }
         [_, command, flag, url] if command == "get" && flag == "-c" => {
-            get(url, true, ip_version).await
+            get(
+                url,
+                true,
+                ip_version,
+                min_speed_bps,
+                max_retries.unwrap_or(MAX_RETRIES),
+            )
+            .await
         }
         _ => {
-            eprintln!("usage:\n  fileq serve [-v4|-v6] <dir>\n  fileq get [-c] [-v4|-v6] <url>");
+            eprintln!(
+                "usage:\n  fileq serve [-v4|-v6] <dir>\n  fileq get [-c] [-v4|-v6] [--min-speed=KBPS] [--max-retry=N] <url>"
+            );
             std::process::exit(1);
         }
     }
@@ -760,6 +878,31 @@ mod tests {
             .map(String::from)
             .to_vec();
         assert!(take_ip_version(&mut conflicting).is_err());
+    }
+
+    #[test]
+    fn parses_and_checks_download_limits() {
+        let mut args = ["fileq", "get", "--min-speed=100", "--max-retry=20", "url"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            take_number_option(&mut args, "--min-speed").unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            take_number_option(&mut args, "--max-retry").unwrap(),
+            Some(20)
+        );
+        assert_eq!(args, ["fileq", "get", "url"].map(String::from));
+
+        let mut duplicate = ["fileq", "--min-speed=100", "--min-speed=200"]
+            .map(String::from)
+            .to_vec();
+        assert!(take_number_option(&mut duplicate, "--min-speed").is_err());
+
+        let minimum = 100 * 1024;
+        assert!(check_min_speed(3000 * 1024, MIN_SPEED_WINDOW, minimum).is_ok());
+        assert!(check_min_speed(2999 * 1024, MIN_SPEED_WINDOW, minimum).is_err());
     }
 
     #[test]
