@@ -9,7 +9,7 @@ const DEFAULT_PORT: u16 = 4433;
 
 fn server_tls() -> Result<ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
     let cert = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
 
     let mut tls = rustls::ServerConfig::builder()
@@ -76,7 +76,7 @@ async fn recv_path(stream: &mut quinn::RecvStream) -> Result<String> {
 
 async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
     let dir = dir.canonicalize().context("bad dir")?;
-    let mut ep = Endpoint::server(server_tls()?, addr)?;
+    let ep = Endpoint::server(server_tls()?, addr)?;
     eprintln!("serving {:?} on {}", dir, addr);
 
     while let Some(conn) = ep.accept().await {
@@ -134,9 +134,8 @@ async fn get(url_str: &str) -> Result<()> {
 
     // Stream to stdout. Zero-copy-ish.
     let mut buf = vec![0u8; 64 * 1024];
-    let stdout = tokio::io::stdout();
     use tokio::io::AsyncWriteExt;
-    let mut out = stdout.lock();
+    let mut out = tokio::io::stdout();
 
     loop {
         match recv.read(&mut buf).await? {
