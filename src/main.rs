@@ -1,11 +1,11 @@
-use std::{net::SocketAddr, path::Path, sync::Arc};
 use anyhow::{bail, Context, Result};
-use quinn::{Endpoint, ServerConfig, ClientConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 
 const ALPN: &[u8] = b"fileq/1";
 const DEFAULT_PORT: u16 = 4433;
 
-// --- TLS helpers (self-signed, zero config) ---
+// --- TLS helpers (unchanged) ---
 
 fn server_tls() -> Result<ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "0.0.0.0".into()])?;
@@ -23,7 +23,6 @@ fn server_tls() -> Result<ServerConfig> {
 }
 
 fn client_tls() -> Result<ClientConfig> {
-    // Skip verification. We're not building a browser.
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerify))
@@ -38,41 +37,69 @@ fn client_tls() -> Result<ClientConfig> {
 #[derive(Debug)]
 struct SkipVerify;
 impl rustls::client::danger::ServerCertVerifier for SkipVerify {
-    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer, _: &[rustls::pki_types::CertificateDer], _: &rustls::pki_types::ServerName, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer,
+        _: &[rustls::pki_types::CertificateDer],
+        _: &rustls::pki_types::ServerName,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
-    fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
-// --- Protocol: [u64 path_len][path bytes] → [file bytes until FIN] ---
+// --- Protocol v2: [u64 path_len][path][u64 offset] → [bytes until FIN]
 
-async fn send_path(stream: &mut quinn::SendStream, path: &str) -> Result<()> {
+async fn send_request(stream: &mut quinn::SendStream, path: &str, offset: u64) -> Result<()> {
     let b = path.as_bytes();
     stream.write_all(&(b.len() as u64).to_be_bytes()).await?;
     stream.write_all(b).await?;
+    stream.write_all(&offset.to_be_bytes()).await?; // ← new
     stream.finish()?;
     Ok(())
 }
 
-async fn recv_path(stream: &mut quinn::RecvStream) -> Result<String> {
+async fn recv_request(stream: &mut quinn::RecvStream) -> Result<(String, u64)> {
     let mut len_buf = [0u8; 8];
     stream.read_exact(&mut len_buf).await?;
     let len = u64::from_be_bytes(len_buf) as usize;
-    if len > 4096 { bail!("path too long"); }
+    if len > 4096 {
+        bail!("path too long");
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    Ok(String::from_utf8(buf)?)
+    let path = String::from_utf8(buf)?;
+
+    let mut off_buf = [0u8; 8]; // ← new
+    stream.read_exact(&mut off_buf).await?;
+    let offset = u64::from_be_bytes(off_buf);
+
+    Ok((path, offset))
 }
 
-// --- Server ---
+// --- Server (now streams from disk, supports offset) ---
 
 async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
     let dir = dir.canonicalize().context("bad dir")?;
@@ -82,29 +109,58 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
     while let Some(conn) = ep.accept().await {
         let dir = dir.clone();
         tokio::spawn(async move {
-            let conn = match conn.await { Ok(c) => c, Err(_) => return };
+            let conn = match conn.await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
             while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                 let dir = dir.clone();
                 tokio::spawn(async move {
-                    let path = match recv_path(&mut recv).await {
-                        Ok(p) => p,
+                    let (path, offset) = match recv_request(&mut recv).await {
+                        Ok(r) => r,
                         Err(_) => return,
                     };
-                    // Sanitize: strip leading /, reject ..
                     let clean = path.trim_start_matches('/');
                     if clean.contains("..") {
                         let _ = send.write_all(b"403").await;
                         return;
                     }
-                    let file = dir.join(clean);
-                    match tokio::fs::read(&file).await {
-                        Ok(data) => {
-                            eprintln!("→ {} ({} bytes)", clean, data.len());
-                            let _ = send.write_all(&data).await;
-                        }
+                    let file_path = dir.join(clean);
+
+                    // Stream from disk instead of loading whole file into RAM
+                    let mut file = match tokio::fs::File::open(&file_path).await {
+                        Ok(f) => f,
                         Err(_) => {
                             eprintln!("✗ {} not found", clean);
                             let _ = send.write_all(b"404").await;
+                            let _ = send.finish();
+                            return;
+                        }
+                    };
+
+                    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                    if offset > 0 {
+                        if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+                            let _ = send.write_all(b"416").await; // range not satisfiable
+                            let _ = send.finish();
+                            return;
+                        }
+                        eprintln!("→ {} (resume from {})", clean, offset);
+                    } else {
+                        eprintln!("→ {}", clean);
+                    }
+
+                    // Stream in chunks
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        match file.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if send.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                     let _ = send.finish();
@@ -117,11 +173,24 @@ async fn serve(dir: &Path, addr: SocketAddr) -> Result<()> {
 
 // --- Client ---
 
-async fn get(url_str: &str) -> Result<()> {
+async fn get(url_str: &str, resume: bool) -> Result<()> {
     let url = url::Url::parse(url_str)?;
     let host = url.host_str().context("no host")?;
     let port = url.port().unwrap_or(DEFAULT_PORT);
     let path = url.path().to_string();
+
+    // Figure out output: file (with -c) or stdout
+    let filename = path.rsplit('/').next().unwrap_or("download");
+    let out_path = std::path::PathBuf::from(filename);
+
+    let offset = if resume && out_path.exists() {
+        let meta = tokio::fs::metadata(&out_path).await?;
+        let sz = meta.len();
+        eprintln!("resuming {} from byte {}", filename, sz);
+        sz
+    } else {
+        0
+    };
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -130,20 +199,45 @@ async fn get(url_str: &str) -> Result<()> {
     let conn = ep.connect(addr, host)?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
-    send_path(&mut send, &path).await?;
+    send_request(&mut send, &path, offset).await?;
 
-    // Stream to stdout. Zero-copy-ish.
-    let mut buf = vec![0u8; 64 * 1024];
     use tokio::io::AsyncWriteExt;
-    let mut out = tokio::io::stdout();
 
-    loop {
-        match recv.read(&mut buf).await? {
-            None => break,
-            Some(n) => out.write_all(&buf[..n]).await?,
+    if resume {
+        // Append to file
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_path)
+            .await?;
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = offset;
+        loop {
+            match recv.read(&mut buf).await? {
+                None => break,
+                Some(n) => {
+                    file.write_all(&buf[..n]).await?;
+                    total += n as u64;
+                    eprint!("\r{}: {} bytes", filename, total);
+                }
+            }
         }
+        eprintln!(); // newline after progress
+        file.flush().await?;
+    } else {
+        // Stdout (original behavior)
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut out = tokio::io::stdout();
+        loop {
+            match recv.read(&mut buf).await? {
+                None => break,
+                Some(n) => out.write_all(&buf[..n]).await?,
+            }
+        }
+        out.flush().await?;
     }
-    out.flush().await?;
+
     Ok(())
 }
 
@@ -159,11 +253,17 @@ async fn main() -> Result<()> {
             serve(Path::new(dir), addr).await
         }
         Some("get") => {
-            let url = args.get(2).context("usage: quic get <url>")?;
-            get(url).await
+            // Parse optional -c flag
+            let rest = &args[2..];
+            let resume = rest.contains(&"-c".to_string());
+            let url = rest
+                .iter()
+                .find(|a| a.starts_with("http"))
+                .context("usage: quic get [-c] <url>")?;
+            get(url, resume).await
         }
         _ => {
-            eprintln!("usage:\n  quic serve <dir>\n  quic get <url>");
+            eprintln!("usage:\n  quic serve <dir>\n  quic get [-c] <url>");
             std::process::exit(1);
         }
     }
