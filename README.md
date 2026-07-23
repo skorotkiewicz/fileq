@@ -22,13 +22,13 @@ Continue an existing download:
 cargo run --release -- get -c quic://localhost:4433/example.bin
 ```
 
-Set a minimum speed in KB/s and a retry limit:
+Set minimum and maximum speeds in KB/s, plus a retry limit:
 
 ```sh
-cargo run --release -- get --min-speed=100 --max-retry=20 quic://localhost:4433/example.bin
+cargo run --release -- get --min-speed=100 --max-speed=500 --max-retry=20 quic://localhost:4433/example.bin
 ```
 
-If a 30-second window averages below the minimum, fileq reconnects and resumes. Without these options, there is no minimum speed and failed transfers retry up to 15 times.
+If a 30-second window averages below the minimum, fileq reconnects and resumes. The maximum paces the download to that average speed. Without these options, there is no speed limit and failed transfers retry up to 15 times.
 
 IPv4 is the default. Use `-v4` or `-v6` with either command to force an IP version:
 

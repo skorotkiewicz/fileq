@@ -17,6 +17,12 @@ enum IpVersion {
     V6,
 }
 
+#[derive(Clone, Copy)]
+struct SpeedLimits {
+    minimum: Option<u64>,
+    maximum: Option<u64>,
+}
+
 impl IpVersion {
     fn bind_addr(self, port: u16) -> SocketAddr {
         match self {
@@ -522,6 +528,10 @@ fn check_min_speed(bytes: u64, elapsed: Duration, minimum: u64) -> Result<()> {
     Ok(())
 }
 
+fn throttle_delay(bytes: u64, elapsed: Duration, maximum: u64) -> Duration {
+    Duration::from_secs_f64(bytes as f64 / maximum as f64).saturating_sub(elapsed)
+}
+
 // --- Single download attempt ---
 
 async fn download_once(
@@ -531,7 +541,7 @@ async fn download_once(
     out_path: &std::path::Path,
     offset: u64,
     ip_version: IpVersion,
-    min_speed_bps: Option<u64>,
+    speed_limits: SpeedLimits,
 ) -> Result<u64> {
     let mut ep = endpoint(ip_version, 0, None)?;
     let mut client_cfg = client_tls()?;
@@ -570,6 +580,7 @@ async fn download_once(
     let mut last_progress = started;
     let mut speed_window_started = started;
     let mut speed_window_bytes = 0;
+    let mut last_throttle = started;
 
     loop {
         let mut buf = adaptive.buf();
@@ -579,7 +590,8 @@ async fn download_once(
         //   On your 8s-RTT link, reads block for ~8s.
         let read_start = Instant::now();
 
-        let read_timeout = min_speed_bps
+        let read_timeout = speed_limits
+            .minimum
             .map(|_| {
                 MIN_SPEED_WINDOW
                     .saturating_sub(speed_window_started.elapsed())
@@ -595,7 +607,7 @@ async fn download_once(
                 if total >= file_size {
                     break;
                 }
-                if let Some(minimum) = min_speed_bps {
+                if let Some(minimum) = speed_limits.minimum {
                     check_min_speed(speed_window_bytes, speed_window_started.elapsed(), minimum)?;
                     speed_window_started = Instant::now();
                     speed_window_bytes = 0;
@@ -625,9 +637,17 @@ async fn download_once(
                 transferred += n as u64;
                 speed_window_bytes += n as u64;
 
+                if let Some(maximum) = speed_limits.maximum {
+                    let delay = throttle_delay(n as u64, last_throttle.elapsed(), maximum);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    last_throttle = Instant::now();
+                }
+
                 let now = Instant::now();
                 let window_elapsed = now.duration_since(speed_window_started);
-                if let Some(minimum) = min_speed_bps {
+                if let Some(minimum) = speed_limits.minimum {
                     if total < file_size && window_elapsed >= MIN_SPEED_WINDOW {
                         check_min_speed(speed_window_bytes, window_elapsed, minimum)?;
                         speed_window_started = now;
@@ -682,7 +702,7 @@ async fn get(
     url_str: &str,
     resume: bool,
     ip_version: IpVersion,
-    min_speed_bps: Option<u64>,
+    speed_limits: SpeedLimits,
     max_retries: u32,
 ) -> Result<()> {
     let url = url::Url::parse(url_str)?;
@@ -734,7 +754,7 @@ async fn get(
             &out_path,
             offset,
             ip_version,
-            min_speed_bps,
+            speed_limits,
         )
         .await
         {
@@ -797,27 +817,48 @@ fn take_number_option(args: &mut Vec<String>, option: &str) -> Result<Option<u64
     Ok(value)
 }
 
+fn to_bytes_per_second(value: Option<u64>, option: &str) -> Result<Option<u64>> {
+    match value {
+        Some(0) => bail!("{option} must be greater than zero"),
+        Some(speed) => Ok(Some(
+            speed
+                .checked_mul(1024)
+                .with_context(|| format!("{option} is too large"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+fn make_speed_limits(minimum: Option<u64>, maximum: Option<u64>) -> Result<SpeedLimits> {
+    let limits = SpeedLimits {
+        minimum: to_bytes_per_second(minimum, "--min-speed")?,
+        maximum: to_bytes_per_second(maximum, "--max-speed")?,
+    };
+    if matches!((limits.minimum, limits.maximum), (Some(min), Some(max)) if min >= max) {
+        bail!("--min-speed must be lower than --max-speed");
+    }
+    Ok(limits)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     let ip_version = take_ip_version(&mut args)?;
     let min_speed = take_number_option(&mut args, "--min-speed")?;
+    let max_speed = take_number_option(&mut args, "--max-speed")?;
+    let speed_limits = make_speed_limits(min_speed, max_speed)?;
     let max_retries = take_number_option(&mut args, "--max-retry")?
         .map(u32::try_from)
         .transpose()
         .context("--max-retry is too large")?;
-    let min_speed_bps = match min_speed {
-        Some(0) => bail!("--min-speed must be greater than zero"),
-        Some(speed) => Some(
-            speed
-                .checked_mul(1024)
-                .context("--min-speed is too large")?,
-        ),
-        None => None,
-    };
 
     match args.as_slice() {
-        [_, command, dir] if command == "serve" && min_speed.is_none() && max_retries.is_none() => {
+        [_, command, dir]
+            if command == "serve"
+                && min_speed.is_none()
+                && max_speed.is_none()
+                && max_retries.is_none() =>
+        {
             serve(Path::new(dir), ip_version).await
         }
         [_, command, url] if command == "get" => {
@@ -825,7 +866,7 @@ async fn main() -> Result<()> {
                 url,
                 false,
                 ip_version,
-                min_speed_bps,
+                speed_limits,
                 max_retries.unwrap_or(MAX_RETRIES),
             )
             .await
@@ -835,14 +876,14 @@ async fn main() -> Result<()> {
                 url,
                 true,
                 ip_version,
-                min_speed_bps,
+                speed_limits,
                 max_retries.unwrap_or(MAX_RETRIES),
             )
             .await
         }
         _ => {
             eprintln!(
-                "usage:\n  fileq serve [-v4|-v6] <dir>\n  fileq get [-c] [-v4|-v6] [--min-speed=KBPS] [--max-retry=N] <url>"
+                "usage:\n  fileq serve [-v4|-v6] <dir>\n  fileq get [-c] [-v4|-v6] [--min-speed=KBPS] [--max-speed=KBPS] [--max-retry=N] <url>"
             );
             std::process::exit(1);
         }
@@ -882,12 +923,23 @@ mod tests {
 
     #[test]
     fn parses_and_checks_download_limits() {
-        let mut args = ["fileq", "get", "--min-speed=100", "--max-retry=20", "url"]
-            .map(String::from)
-            .to_vec();
+        let mut args = [
+            "fileq",
+            "get",
+            "--min-speed=100",
+            "--max-speed=500",
+            "--max-retry=20",
+            "url",
+        ]
+        .map(String::from)
+        .to_vec();
         assert_eq!(
             take_number_option(&mut args, "--min-speed").unwrap(),
             Some(100)
+        );
+        assert_eq!(
+            take_number_option(&mut args, "--max-speed").unwrap(),
+            Some(500)
         );
         assert_eq!(
             take_number_option(&mut args, "--max-retry").unwrap(),
@@ -900,9 +952,19 @@ mod tests {
             .to_vec();
         assert!(take_number_option(&mut duplicate, "--min-speed").is_err());
 
-        let minimum = 100 * 1024;
+        let limits = make_speed_limits(Some(100), Some(500)).unwrap();
+        let minimum = limits.minimum.unwrap();
+        assert_eq!(limits.maximum, Some(500 * 1024));
+        assert!(make_speed_limits(Some(500), Some(500)).is_err());
+        assert!(make_speed_limits(Some(501), Some(500)).is_err());
+        assert!(make_speed_limits(None, Some(0)).is_err());
         assert!(check_min_speed(3000 * 1024, MIN_SPEED_WINDOW, minimum).is_ok());
         assert!(check_min_speed(2999 * 1024, MIN_SPEED_WINDOW, minimum).is_err());
+        assert_eq!(
+            throttle_delay(100 * 1024, Duration::from_millis(250), minimum),
+            Duration::from_millis(750)
+        );
+        assert!(throttle_delay(100 * 1024, Duration::from_secs(2), minimum).is_zero());
     }
 
     #[test]
