@@ -1,5 +1,6 @@
 [package]
-name = "quic"
+name = "fileq"
+description = "A small QUIC file transfer tool for high-latency and intermittent connections."
 version = "0.1.0"
 edition = "2021"
 

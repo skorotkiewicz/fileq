@@ -1,6 +1,6 @@
 # quic
 
-A small QUIC file transfer tool for slow or unreliable links. It adjusts chunk sizes as latency changes and retries interrupted downloads from the last byte written.
+A small QUIC file transfer tool for slow or intermittent connections. It adjusts chunk sizes as latency changes and retries interrupted downloads from the last byte written.
 
 ## Usage
 
