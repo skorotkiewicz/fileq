@@ -22,6 +22,13 @@ Continue an existing download:
 cargo run --release -- get -c quic://localhost:4433/example.bin
 ```
 
+IPv4 is the default. Use `-v4` or `-v6` with either command to force an IP version:
+
+```sh
+cargo run --release -- serve -v6 ./files
+cargo run --release -- get -v6 'quic://[::1]:4433/example.bin'
+```
+
 ## Security
 
 The server listens on all interfaces and creates a self-signed certificate each time it starts. The client accepts any certificate, so use this only on a trusted network.

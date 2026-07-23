@@ -221,6 +221,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "socket2",
  "tokio",
  "url",
 ]
