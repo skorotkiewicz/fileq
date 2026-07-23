@@ -472,7 +472,13 @@ async fn serve(dir: &Path, ip_version: IpVersion) -> Result<()> {
 
 // --- Progress ---
 
-fn progress_line(total: u64, transferred: u64, file_size: u64, elapsed: Duration) -> String {
+fn progress_line(
+    filename: &str,
+    total: u64,
+    transferred: u64,
+    file_size: u64,
+    elapsed: Duration,
+) -> String {
     let percent = if file_size == 0 {
         100
     } else {
@@ -483,18 +489,22 @@ fn progress_line(total: u64, transferred: u64, file_size: u64, elapsed: Duration
     } else {
         transferred as f64 / elapsed.as_secs_f64()
     };
-    let eta = if speed == 0.0 {
+    let complete = total >= file_size;
+    let seconds = if complete {
+        elapsed.as_secs()
+    } else if speed == 0.0 {
         0
     } else {
         (file_size.saturating_sub(total) as f64 / speed) as u64
     };
+    let eta = if complete { "" } else { " ETA" };
 
     format!(
-        "{percent:3}% {}KB {:.1}KB/s   {:02}:{:02} ETA",
+        "{filename:<32} {percent:3}% {:>8}KB {:>8.1}KB/s   {:02}:{:02}{eta}",
         total / 1024,
         speed / 1024.0,
-        eta / 60,
-        eta % 60
+        seconds / 60,
+        seconds % 60
     )
 }
 
@@ -534,6 +544,10 @@ async fn download_once(
         .open(out_path)
         .await?;
 
+    let filename = out_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
     let mut adaptive = AdaptiveChunk::new();
     let mut total = offset;
     let mut transferred: u64 = 0;
@@ -588,8 +602,14 @@ async fn download_once(
                 };
                 if now.duration_since(last_progress) >= interval {
                     eprint!(
-                        "\r{:<60}",
-                        progress_line(total, transferred, file_size, now.duration_since(started))
+                        "\r{}\x1b[K",
+                        progress_line(
+                            filename,
+                            total,
+                            transferred,
+                            file_size,
+                            now.duration_since(started)
+                        )
                     );
                     last_progress = now;
                 }
@@ -600,8 +620,8 @@ async fn download_once(
     }
 
     eprintln!(
-        "\r{:<60}",
-        progress_line(total, transferred, file_size, started.elapsed())
+        "\r{}\x1b[K",
+        progress_line(filename, total, transferred, file_size, started.elapsed())
     );
     file.flush().await?;
 
@@ -746,12 +766,23 @@ mod tests {
     fn formats_progress() {
         assert_eq!(
             progress_line(
+                "fileq",
                 1536 * 1024,
                 1024 * 1024,
                 3072 * 1024,
                 Duration::from_secs(2)
             ),
-            " 50% 1536KB 512.0KB/s   00:03 ETA"
+            "fileq                             50%     1536KB    512.0KB/s   00:03 ETA"
+        );
+        assert_eq!(
+            progress_line(
+                "fileq",
+                3465 * 1024,
+                3440 * 1024,
+                3465 * 1024,
+                Duration::from_secs(16)
+            ),
+            "fileq                            100%     3465KB    215.0KB/s   00:16"
         );
     }
 
